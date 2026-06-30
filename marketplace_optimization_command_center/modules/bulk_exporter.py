@@ -19,7 +19,7 @@ except Exception:
     from .config import EXPORTS_DIR, APP_DIR
     from .data_loader import slugify
 
-BULK_EXPORTER_VERSION = "2026-06-30-split-adtype-template-v2"
+BULK_EXPORTER_VERSION = "2026-06-30-brand-safety-optional-v3"
 
 TEMPLATE_PATH = APP_DIR / "templates" / "PxP_SP_Bulk_Upload_Jun25_2026_FIXED_v2.xlsx"
 DEFAULT_COLUMNS = [
@@ -189,6 +189,25 @@ def _campaign_budget_row(row: pd.Series, ad_type: str) -> dict:
     }
 
 
+def _truthy(value) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "include"}
+
+
+def _brand_safety_uploadable(row: pd.Series) -> bool:
+    # Grouped brand-safety rows are useful for review, but risky as upload rows when they span multiple campaigns.
+    # Only allow them into a bulk upload when the UI explicitly marks them and they resolve to one campaign/ad group.
+    if not _truthy(row.get("include_in_bulk_upload", False)):
+        return False
+    multi = str(row.get("is_multi_campaign_brand_safety", "")).strip().lower()
+    if multi in {"true", "1", "yes"}:
+        return False
+    campaign = _safe_text(row.get("campaign"))
+    ad_group = _safe_text(row.get("ad_group"))
+    if re.match(r"^\d+ campaigns$", campaign.lower()) or re.match(r"^\d+ ad groups$", ad_group.lower()):
+        return False
+    return bool(campaign and ad_group)
+
+
 def build_bulk_rows(actions: pd.DataFrame, ad_type: str) -> pd.DataFrame:
     headers = _template_headers()
     rows: list[dict] = []
@@ -198,8 +217,11 @@ def build_bulk_rows(actions: pd.DataFrame, ad_type: str) -> pd.DataFrame:
         reason = _safe_text(row.get("reason_code"))
         category = _safe_text(row.get("category"))
         suggested_bid = _safe_float(row.get("suggested_bid"), 0)
-        if reason in {"brand_safety_grouped", "high_click_no_order"}:
+        if reason == "high_click_no_order":
             rows.append(_negative_keyword_row(row, ad_type))
+        elif reason == "brand_safety_grouped":
+            if _brand_safety_uploadable(row):
+                rows.append(_negative_keyword_row(row, ad_type))
         if suggested_bid > 0 and reason not in {"brand_safety_grouped"}:
             rows.append(_bid_update_row(row, ad_type))
         if category.lower().startswith("budget"):
