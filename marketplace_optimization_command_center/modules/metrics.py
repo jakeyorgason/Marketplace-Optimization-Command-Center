@@ -3,7 +3,7 @@ import math
 import pandas as pd
 from .data_loader import latest_report, get_latest_performance_source
 
-METRICS_VERSION = "2026-06-30-clean-metrics-v1"
+METRICS_VERSION = "2026-06-30-combined-performance-v2"
 
 def _num(value, default=0.0) -> float:
     try:
