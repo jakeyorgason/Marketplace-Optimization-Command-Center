@@ -4,7 +4,7 @@ import re
 from typing import Any
 import pandas as pd
 
-RULES_ENGINE_VERSION = "2026-06-30-brand-campaign-details-v7"
+RULES_ENGINE_VERSION = "2026-06-30-brand-campaign-level-v8"
 PRIORITY_ORDER = {"High": 0, "Medium": 1, "Low": 2}
 
 GENERIC_FORBIDDEN_PARTS = {"energy", "drink", "drinks", "water", "sparkling", "caffeine", "natural", "organic", "the", "and"}
@@ -114,7 +114,9 @@ def generate_actions(performance_df: pd.DataFrame, client_config: dict | None = 
     min_clicks = int(_safe_float(settings.get("min_clicks", 10), 10))
     actions: list[dict] = []
 
-    # Brand Safety grouped by unique shopper/target text. Never campaign/ad group names.
+    # Brand Safety grouped by ad type + campaign + ad group + shopper/target text.
+    # This keeps repeated rows deduped, but allows approving a negation for one
+    # campaign/ad group without applying it to every campaign where the term appears.
     brand_groups: dict[str, dict] = {}
     if forbidden_terms:
         for _, row in df.iterrows():
@@ -124,17 +126,20 @@ def generate_actions(performance_df: pd.DataFrame, client_config: dict | None = 
             matches = _matches_forbidden(target_text, forbidden_terms)
             if not matches:
                 continue
-            key = target_text.lower().strip()
+            campaign_name = _campaign(row)
+            ad_group_name = _ad_group(row)
+            ad_type = _safe_text(row.get("ad_type", "Unknown")) or "Unknown"
+            key = "||".join([ad_type.lower().strip(), campaign_name.lower().strip(), ad_group_name.lower().strip(), target_text.lower().strip()])
             g = brand_groups.setdefault(key, {
                 "priority": "High",
                 "category": "Brand Safety",
                 "area": "Ads",
                 "issue": "Forbidden/branded term found in shopper query or target",
                 "recommendation": "Review whether this should be excluded from non-brand campaigns or moved to a controlled brand campaign.",
-                "ad_type": _safe_text(row.get("ad_type", "Unknown")) or "Unknown",
-                "campaign": "",
-                "ad_group": "",
-                "target": key,
+                "ad_type": ad_type,
+                "campaign": campaign_name or "not available",
+                "ad_group": ad_group_name or "not available",
+                "target": target_text.lower().strip(),
                 "spend": 0.0,
                 "ad_sales": 0.0,
                 "clicks": 0.0,
@@ -144,7 +149,7 @@ def generate_actions(performance_df: pd.DataFrame, client_config: dict | None = 
                 "suggested_change_pct": 0.0,
                 "estimated_monthly_impact": 0.0,
                 "confidence": "High",
-                "reason_code": "brand_safety_grouped",
+                "reason_code": "brand_safety_campaign_adgroup_grouped",
                 "evidence": f"Matched forbidden term(s): {', '.join(matches)}",
                 "rows_found": 0,
                 "campaigns_found": set(),
