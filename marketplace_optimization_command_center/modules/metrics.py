@@ -1,8 +1,12 @@
 from __future__ import annotations
 import pandas as pd
-from modules.data_loader import latest_report, get_latest_performance_source
 
-METRICS_VERSION = "2026-06-30-absolute-imports-combined-perf-v2"
+try:
+    from modules.data_loader import latest_report, get_latest_performance_source
+except Exception:
+    from .data_loader import latest_report, get_latest_performance_source
+
+METRICS_VERSION = "2026-06-30-adtype-metrics-v2"
 
 
 def _num(value, default=0.0) -> float:
@@ -23,9 +27,8 @@ def summarize_business_sales(client_name: str) -> float:
     rec, df = latest_report(client_name, "business_report")
     if df.empty:
         return 0.0
-    for col in ["total_sales", "ordered_product_sales", "product_sales", "sales"]:
-        if col in df.columns:
-            return float(pd.to_numeric(df[col], errors="coerce").fillna(0).sum())
+    if "total_sales" in df.columns:
+        return float(pd.to_numeric(df["total_sales"], errors="coerce").fillna(0).sum())
     if "ad_sales" in df.columns:
         return float(pd.to_numeric(df["ad_sales"], errors="coerce").fillna(0).sum())
     return 0.0
@@ -39,11 +42,11 @@ def summarize_performance(df: pd.DataFrame, total_sales_override: float = 0.0) -
     clicks = float(pd.to_numeric(df.get("clicks", 0), errors="coerce").fillna(0).sum()) if "clicks" in df else 0.0
     orders = float(pd.to_numeric(df.get("orders", 0), errors="coerce").fillna(0).sum()) if "orders" in df else 0.0
     impressions = float(pd.to_numeric(df.get("impressions", 0), errors="coerce").fillna(0).sum()) if "impressions" in df else 0.0
-    total_sales = float(total_sales_override) if total_sales_override and total_sales_override > 0 else ad_sales
+    total_sales = total_sales_override if total_sales_override and total_sales_override > 0 else ad_sales
     return {
         "spend": spend,
         "ad_sales": ad_sales,
-        "total_sales": total_sales,
+        "total_sales": float(total_sales),
         "acos": spend / ad_sales if ad_sales else 0,
         "tacos": spend / total_sales if total_sales else 0,
         "clicks": clicks,
@@ -60,7 +63,7 @@ def health_score(metrics: dict, client_config: dict, action_count: int = 0) -> t
     target_acos = _pct_from_config(client_config.get("target_acos", 0.5), 0.5)
     monthly_budget = _num(client_config.get("monthly_budget", 0), 0)
     score = 100
-    flags: list[str] = []
+    flags = []
     if target_tacos and metrics.get("tacos", 0) > target_tacos * 1.15:
         score -= 25; flags.append(f"TACOS is {metrics['tacos']:.1%} vs {target_tacos:.1%} target")
     if target_acos and metrics.get("acos", 0) > target_acos * 1.15:
