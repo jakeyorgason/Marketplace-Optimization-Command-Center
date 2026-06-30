@@ -4,7 +4,7 @@ import re
 from typing import Any
 import pandas as pd
 
-RULES_ENGINE_VERSION = "2026-06-30-bulk-ai-export-v5"
+RULES_ENGINE_VERSION = "2026-06-30-brand-safety-optional-v6"
 PRIORITY_ORDER = {"High": 0, "Medium": 1, "Low": 2}
 
 GENERIC_FORBIDDEN_PARTS = {"energy", "drink", "drinks", "water", "sparkling", "caffeine", "natural", "organic", "the", "and"}
@@ -149,6 +149,8 @@ def generate_actions(performance_df: pd.DataFrame, client_config: dict | None = 
                 "rows_found": 0,
                 "campaigns_found": set(),
                 "ad_groups_found": set(),
+                "campaign_ids_found": set(),
+                "ad_group_ids_found": set(),
             })
             spend = _safe_float(row.get("spend"))
             ad_sales = _safe_float(row.get("ad_sales"))
@@ -158,12 +160,39 @@ def generate_actions(performance_df: pd.DataFrame, client_config: dict | None = 
             g["rows_found"] += 1
             if _campaign(row): g["campaigns_found"].add(_campaign(row))
             if _ad_group(row): g["ad_groups_found"].add(_ad_group(row))
+            cid = _safe_text(row.get("raw__campaign_id", "")) or _safe_text(row.get("campaign_id", ""))
+            agid = _safe_text(row.get("raw__ad_group_id", "")) or _safe_text(row.get("ad_group_id", ""))
+            if cid: g["campaign_ids_found"].add(cid)
+            if agid: g["ad_group_ids_found"].add(agid)
         for g in brand_groups.values():
+            campaigns = sorted(g.get("campaigns_found", set()))
+            ad_groups = sorted(g.get("ad_groups_found", set()))
+            campaign_ids = sorted(g.get("campaign_ids_found", set()))
+            ad_group_ids = sorted(g.get("ad_group_ids_found", set()))
             g["estimated_monthly_impact"] = _estimate_impact(g["spend"], g["ad_sales"], "Brand Safety")
-            g["evidence"] = f"{g['evidence']} | {g['rows_found']} rows, {len(g['campaigns_found'])} campaigns, {len(g['ad_groups_found'])} ad groups"
-            g["campaign"] = f"{len(g['campaigns_found'])} campaigns"
-            g["ad_group"] = f"{len(g['ad_groups_found'])} ad groups"
+            g["affected_campaigns"] = ", ".join(campaigns[:12]) + (" ..." if len(campaigns) > 12 else "")
+            g["affected_ad_groups"] = ", ".join(ad_groups[:12]) + (" ..." if len(ad_groups) > 12 else "")
+            g["campaign_count"] = len(campaigns)
+            g["ad_group_count"] = len(ad_groups)
+            g["is_multi_campaign_brand_safety"] = len(campaigns) != 1 or len(ad_groups) != 1
+            if len(campaigns) == 1:
+                g["campaign"] = campaigns[0]
+            else:
+                g["campaign"] = f"{len(campaigns)} campaigns"
+            if len(ad_groups) == 1:
+                g["ad_group"] = ad_groups[0]
+            else:
+                g["ad_group"] = f"{len(ad_groups)} ad groups"
+            if len(campaign_ids) == 1:
+                g["raw__campaign_id"] = campaign_ids[0]
+            if len(ad_group_ids) == 1:
+                g["raw__ad_group_id"] = ad_group_ids[0]
+            g["evidence"] = (
+                f"{g['evidence']} | {g['rows_found']} rows, {len(campaigns)} campaigns, "
+                f"{len(ad_groups)} ad groups. Affected campaigns: {g['affected_campaigns'] or 'not available'}"
+            )
             g.pop("campaigns_found", None); g.pop("ad_groups_found", None)
+            g.pop("campaign_ids_found", None); g.pop("ad_group_ids_found", None)
             if g["spend"] < 10 and g["clicks"] < 5:
                 g["priority"] = "Medium"
             actions.append(g)
