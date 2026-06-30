@@ -46,9 +46,7 @@ with st.expander("Recommendation settings", expanded=False):
     min_spend = st.number_input("Minimum spend for waste rules", value=20.0, step=5.0)
     min_clicks = st.number_input("Minimum clicks for click-based rules", value=10, step=1)
     show_all = st.checkbox("Show medium/low priority actions too", value=False)
-    high_priority_ai = st.checkbox("AI audit should approve high-priority actions only", value=True)
-    ai_key = st.text_input("Optional OpenAI API key for smarter audit", type="password", help="Leave blank to use the built-in deterministic audit.")
-    ai_model = st.text_input("AI model", value="gpt-5.5-mini")
+    st.caption("AI audit uses OPENAI_API_KEY, OPENAI_MODEL, and OPENAI_REASONING_EFFORT from Streamlit secrets.")
 settings = {"min_spend": min_spend, "min_clicks": min_clicks}
 
 sections = latest_performance_sections(client)
@@ -71,14 +69,13 @@ if all(df.empty for df in actions_by_ad_type.values()):
     st.stop()
 
 st.subheader("AI Audit & Build Plan")
+st.caption("The audit reviews all generated SP/SB/SD actions, not just high-priority actions. Final exports still require row-level approval below.")
 if st.button("Run AI bulk audit", type="primary") or "bulk_ai_audit" not in st.session_state:
     st.session_state["bulk_ai_audit"] = run_ai_bulk_audit(
         client_name=client,
         cfg=cfg,
         actions_by_ad_type=actions_by_ad_type,
         metrics_by_ad_type=metrics_by_ad_type,
-        api_key=ai_key or None,
-        model=ai_model,
     )
 
 audit = st.session_state.get("bulk_ai_audit", {})
@@ -88,7 +85,7 @@ if audit.get("warnings"):
         for warning in audit.get("warnings", []):
             st.warning(warning)
 
-approved_by_ai = apply_audit_decisions(actions_by_ad_type, audit, high_priority_only=high_priority_ai)
+approved_by_ai = apply_audit_decisions(actions_by_ad_type, audit, high_priority_only=False)
 
 st.subheader("SP / SB / SD Build Sections")
 final_selected: dict[str, pd.DataFrame] = {}
