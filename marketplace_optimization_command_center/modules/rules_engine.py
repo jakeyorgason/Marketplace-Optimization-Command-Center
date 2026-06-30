@@ -4,7 +4,7 @@ import re
 from typing import Any
 import pandas as pd
 
-RULES_ENGINE_VERSION = "2026-06-30-clean-brand-grouped-v4"
+RULES_ENGINE_VERSION = "2026-06-30-adtype-sections-v5"
 PRIORITY_ORDER = {"High": 0, "Medium": 1, "Low": 2}
 
 GENERIC_FORBIDDEN_PARTS = {"energy", "drink", "drinks", "water", "sparkling", "caffeine", "natural", "organic", "the", "and"}
@@ -115,6 +115,7 @@ def generate_actions(performance_df: pd.DataFrame, client_config: dict | None = 
                 "area": "Ads",
                 "issue": "Forbidden/branded term found in shopper query or target",
                 "recommendation": "Review whether this should be excluded from non-brand campaigns or moved to a controlled brand campaign.",
+                "ad_type": _safe_text(row.get("ad_type", "Unknown")) or "Unknown",
                 "campaign": "",
                 "ad_group": "",
                 "target": key,
@@ -165,7 +166,7 @@ def generate_actions(performance_df: pd.DataFrame, client_config: dict | None = 
         target = _best_target_text(row)
         campaign = _campaign(row)
         ad_group = _ad_group(row)
-        base = {"campaign": campaign, "ad_group": ad_group, "target": target, "spend": round(spend,2), "ad_sales": round(ad_sales,2), "clicks": int(clicks), "orders": int(orders), "current_bid": current_bid}
+        base = {"ad_type": _safe_text(row.get("ad_type", "Unknown")) or "Unknown", "campaign": campaign, "ad_group": ad_group, "target": target, "spend": round(spend,2), "ad_sales": round(ad_sales,2), "clicks": int(clicks), "orders": int(orders), "current_bid": current_bid}
 
         if spend >= min_spend and clicks >= min_clicks and orders == 0:
             key = ("waste_no_orders", campaign, ad_group, target)
