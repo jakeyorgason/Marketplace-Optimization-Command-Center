@@ -183,18 +183,23 @@ for ad_type in ["SP", "SB", "SD"]:
         if section_summary:
             st.write(section_summary)
         cols = [c for c in [
-            "priority", "category", "issue", "recommendation", "campaign", "ad_group", "affected_campaigns", "affected_ad_groups", "target",
+            "priority", "category", "issue", "recommendation", "target",
+            "campaign", "ad_group", "affected_campaigns", "affected_ad_groups", "campaign_count", "ad_group_count",
             "spend", "ad_sales", "clicks", "orders", "current_bid", "suggested_bid", "reason_code", "evidence"
         ] if c in display.columns]
         table = display.copy().reset_index(drop=True)
         table["_row_id"] = table.index
         editor_df = table[["_row_id"] + cols].copy()
         if "reason_code" in editor_df.columns:
-            editor_df["approve"] = ~editor_df["reason_code"].astype(str).eq("brand_safety_grouped")
+            approve_default = ~editor_df["reason_code"].astype(str).eq("brand_safety_grouped")
             if include_brand_safety_upload:
-                editor_df["approve"] = True
+                approve_default = pd.Series([True] * len(editor_df), index=editor_df.index)
         else:
-            editor_df["approve"] = True
+            approve_default = pd.Series([True] * len(editor_df), index=editor_df.index)
+
+        # Keep the approval checkbox as the first visible column.
+        editor_df.insert(0, "approve", approve_default.astype(bool))
+
         edited = st.data_editor(
             editor_df,
             use_container_width=True,
