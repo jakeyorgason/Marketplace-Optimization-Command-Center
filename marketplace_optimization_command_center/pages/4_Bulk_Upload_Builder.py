@@ -14,6 +14,7 @@ from modules.bulk_exporter import (
     export_bulk_review_workbook,
     zip_bulk_files,
     build_bulk_rows,
+    build_bulk_validation,
     BULK_EXPORTER_VERSION,
 )
 
@@ -90,7 +91,7 @@ def _prepare_export_selection(df: pd.DataFrame, include_brand: bool, exclude_bra
     if "reason_code" not in out.columns:
         out["include_in_bulk_upload"] = True
         return out
-    brand_mask = out["reason_code"].astype(str).eq("brand_safety_grouped")
+    brand_mask = out["reason_code"].astype(str).str.startswith("brand_safety")
     out["include_in_bulk_upload"] = True
     if brand_mask.any():
         out.loc[brand_mask, "include_in_bulk_upload"] = bool(include_brand)
@@ -144,7 +145,7 @@ approved_by_ai = apply_audit_decisions(actions_by_ad_type, audit, high_priority_
 brand_review_count = 0
 for _df in actions_by_ad_type.values():
     if _df is not None and not _df.empty and "reason_code" in _df.columns:
-        brand_review_count += int(_df["reason_code"].astype(str).eq("brand_safety_grouped").sum())
+        brand_review_count += int(_df["reason_code"].astype(str).str.startswith("brand_safety").sum())
 if brand_review_count:
     if include_brand_safety_upload:
         st.warning(f"Brand Safety upload is ON. {brand_review_count:,} Brand Safety review rows can be included only if approved and upload-safe.")
@@ -166,7 +167,7 @@ for ad_type in ["SP", "SB", "SD"]:
     display = suggested.copy()
     # Always surface Brand Safety rows for visibility/review, even when AI keeps them out of the default export plan.
     if "reason_code" in generated.columns:
-        brand_rows = generated[generated["reason_code"].astype(str).eq("brand_safety_grouped")].copy()
+        brand_rows = generated[generated["reason_code"].astype(str).str.startswith("brand_safety")].copy()
         if not brand_rows.empty:
             display = pd.concat([display, brand_rows], ignore_index=True).drop_duplicates()
     if show_all:
@@ -177,7 +178,7 @@ for ad_type in ["SP", "SB", "SD"]:
         final_selected[ad_type] = pd.DataFrame()
         continue
 
-    upload_preview = build_bulk_rows(display, ad_type)
+    upload_preview = build_bulk_rows(display, ad_type, client_name=client)
     with st.expander(f"{ad_type} Actions ({len(display):,} shown, {len(upload_preview):,} upload rows)", expanded=(ad_type == "SP")):
         section_summary = audit.get("sections", {}).get(ad_type, {}).get("summary", "")
         if section_summary:
@@ -192,7 +193,7 @@ for ad_type in ["SP", "SB", "SD"]:
         table["_row_id"] = table.index
         editor_df = table[["_row_id"] + cols].copy()
         if "reason_code" in editor_df.columns:
-            approve_default = ~editor_df["reason_code"].astype(str).eq("brand_safety_grouped")
+            approve_default = ~editor_df["reason_code"].astype(str).str.startswith("brand_safety")
             if include_brand_safety_upload:
                 approve_default = pd.Series([True] * len(editor_df), index=editor_df.index)
         else:
@@ -218,14 +219,19 @@ for ad_type in ["SP", "SB", "SD"]:
         )
 
         with st.expander(f"{ad_type} upload preview", expanded=False):
-            preview = build_bulk_rows(final_selected[ad_type], ad_type)
+            preview = build_bulk_rows(final_selected[ad_type], ad_type, client_name=client)
+            skipped = build_bulk_validation(final_selected[ad_type], ad_type, client_name=client)
+            st.caption(f"Valid upload rows: {len(preview):,}. Skipped invalid/unmatched rows: {len(skipped):,}.")
             st.dataframe(preview, use_container_width=True)
+            if not skipped.empty:
+                st.warning("Some approved actions were kept out of the upload because Amazon requires IDs that could not be resolved. Re-upload the newest Bulk Operations download if this count is high.")
+                st.dataframe(skipped, use_container_width=True)
             brand_selected = 0
             brand_uploadable = 0
             if not final_selected[ad_type].empty and "reason_code" in final_selected[ad_type].columns:
-                brand_selected = int(final_selected[ad_type]["reason_code"].astype(str).eq("brand_safety_grouped").sum())
+                brand_selected = int(final_selected[ad_type]["reason_code"].astype(str).str.startswith("brand_safety").sum())
                 if "include_in_bulk_upload" in final_selected[ad_type].columns:
-                    brand_uploadable = int((final_selected[ad_type]["reason_code"].astype(str).eq("brand_safety_grouped") & final_selected[ad_type]["include_in_bulk_upload"].astype(bool)).sum())
+                    brand_uploadable = int((final_selected[ad_type]["reason_code"].astype(str).str.startswith("brand_safety") & final_selected[ad_type]["include_in_bulk_upload"].astype(bool)).sum())
             if brand_selected:
                 st.caption(f"Brand Safety selected for review: {brand_selected:,}. Brand Safety eligible for upload after safeguards: {brand_uploadable:,}.")
 
@@ -235,7 +241,7 @@ created_paths = []
 
 for idx, ad_type in enumerate(["SP", "SB", "SD"]):
     selected = final_selected.get(ad_type, pd.DataFrame())
-    upload_rows = build_bulk_rows(selected, ad_type)
+    upload_rows = build_bulk_rows(selected, ad_type, client_name=client)
     with export_cols[idx]:
         st.metric(f"{ad_type} upload rows", len(upload_rows))
         if st.button(f"Build {ad_type} upload", disabled=upload_rows.empty, key=f"build_{ad_type}"):
@@ -267,4 +273,4 @@ if zip_saved:
     with open(zip_saved, "rb") as f:
         st.download_button("Download zip", f, file_name=zip_saved.split("/")[-1])
 
-st.caption("Important: re-upload the Bulk Operations workbook after installing this patch so original ID/template columns are preserved for cleaner exports.")
+st.caption("Important: re-upload the Bulk Operations workbook after installing this patch. The upload parser now preserves Amazon IDs required for valid bulk uploads.")
