@@ -183,8 +183,9 @@ for ad_type in ["SP", "SB", "SD"]:
         if section_summary:
             st.write(section_summary)
         cols = [c for c in [
-            "priority", "category", "issue", "recommendation", "target",
-            "campaign", "ad_group", "affected_campaigns", "affected_ad_groups", "campaign_count", "ad_group_count",
+            "priority", "category", "campaign", "ad_group", "target",
+            "issue", "recommendation",
+            "affected_campaigns", "affected_ad_groups", "campaign_count", "ad_group_count",
             "spend", "ad_sales", "clicks", "orders", "current_bid", "suggested_bid", "reason_code", "evidence"
         ] if c in display.columns]
         table = display.copy().reset_index(drop=True)
