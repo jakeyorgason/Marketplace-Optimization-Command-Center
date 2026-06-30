@@ -45,3 +45,10 @@ def get_client_config(client_name: str) -> dict:
         return {}
     row = df[df["client_name"].astype(str) == str(client_name)].iloc[0].to_dict()
     return row
+
+
+def ensure_directories() -> None:
+    """Compatibility helper for older loader imports."""
+    for path in [CLIENTS_DIR, UPLOADS_DIR, PROCESSED_DIR, EXPORTS_DIR]:
+        path.mkdir(parents=True, exist_ok=True)
+
