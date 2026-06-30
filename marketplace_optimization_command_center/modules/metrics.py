@@ -1,9 +1,9 @@
 from __future__ import annotations
-import math
 import pandas as pd
-from .data_loader import latest_report, get_latest_performance_source
+from modules.data_loader import latest_report, get_latest_performance_source
 
-METRICS_VERSION = "2026-06-30-combined-performance-v2"
+METRICS_VERSION = "2026-06-30-absolute-imports-combined-perf-v2"
+
 
 def _num(value, default=0.0) -> float:
     try:
@@ -13,19 +13,23 @@ def _num(value, default=0.0) -> float:
     except Exception:
         return default
 
+
 def _pct_from_config(value, default=0.0) -> float:
     n = _num(value, default)
     return n / 100 if n > 1 else n
+
 
 def summarize_business_sales(client_name: str) -> float:
     rec, df = latest_report(client_name, "business_report")
     if df.empty:
         return 0.0
-    if "total_sales" in df.columns:
-        return float(pd.to_numeric(df["total_sales"], errors="coerce").fillna(0).sum())
+    for col in ["total_sales", "ordered_product_sales", "product_sales", "sales"]:
+        if col in df.columns:
+            return float(pd.to_numeric(df[col], errors="coerce").fillna(0).sum())
     if "ad_sales" in df.columns:
         return float(pd.to_numeric(df["ad_sales"], errors="coerce").fillna(0).sum())
     return 0.0
+
 
 def summarize_performance(df: pd.DataFrame, total_sales_override: float = 0.0) -> dict:
     if df is None or df.empty:
@@ -35,11 +39,11 @@ def summarize_performance(df: pd.DataFrame, total_sales_override: float = 0.0) -
     clicks = float(pd.to_numeric(df.get("clicks", 0), errors="coerce").fillna(0).sum()) if "clicks" in df else 0.0
     orders = float(pd.to_numeric(df.get("orders", 0), errors="coerce").fillna(0).sum()) if "orders" in df else 0.0
     impressions = float(pd.to_numeric(df.get("impressions", 0), errors="coerce").fillna(0).sum()) if "impressions" in df else 0.0
-    total_sales = total_sales_override if total_sales_override and total_sales_override > 0 else ad_sales
+    total_sales = float(total_sales_override) if total_sales_override and total_sales_override > 0 else ad_sales
     return {
         "spend": spend,
         "ad_sales": ad_sales,
-        "total_sales": float(total_sales),
+        "total_sales": total_sales,
         "acos": spend / ad_sales if ad_sales else 0,
         "tacos": spend / total_sales if total_sales else 0,
         "clicks": clicks,
@@ -50,12 +54,13 @@ def summarize_performance(df: pd.DataFrame, total_sales_override: float = 0.0) -
         "cpc": spend / clicks if clicks else 0,
     }
 
+
 def health_score(metrics: dict, client_config: dict, action_count: int = 0) -> tuple[int, str, list[str]]:
     target_tacos = _pct_from_config(client_config.get("target_tacos", 0.12), 0.12)
     target_acos = _pct_from_config(client_config.get("target_acos", 0.5), 0.5)
     monthly_budget = _num(client_config.get("monthly_budget", 0), 0)
     score = 100
-    flags = []
+    flags: list[str] = []
     if target_tacos and metrics.get("tacos", 0) > target_tacos * 1.15:
         score -= 25; flags.append(f"TACOS is {metrics['tacos']:.1%} vs {target_tacos:.1%} target")
     if target_acos and metrics.get("acos", 0) > target_acos * 1.15:
@@ -80,6 +85,7 @@ def health_score(metrics: dict, client_config: dict, action_count: int = 0) -> t
     else:
         status = "Red — Urgent review"
     return score, status, flags
+
 
 def client_metric_snapshot(client_name: str, client_config: dict, action_count: int = 0) -> dict:
     source_type, rec, df = get_latest_performance_source(client_name)
