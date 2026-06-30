@@ -5,12 +5,17 @@ import hashlib
 import json
 import pandas as pd
 
-from modules.config import UPLOADS_DIR, PROCESSED_DIR, get_client_config
-from modules.report_mapper import detect_report_type, standardize_performance_table
+try:
+    from modules.config import UPLOADS_DIR, PROCESSED_DIR, get_client_config
+    from modules.report_mapper import detect_report_type, standardize_performance_table
+except Exception:  # local/package fallback
+    from .config import UPLOADS_DIR, PROCESSED_DIR, get_client_config
+    from .report_mapper import detect_report_type, standardize_performance_table
 
-DATA_LOADER_VERSION = "2026-06-30-absolute-imports-combined-perf-v2"
-
+DATA_LOADER_VERSION = "2026-06-30-adtype-loader-v2"
 META_FILE = PROCESSED_DIR / "processed_reports.jsonl"
+AD_TYPES = ["SP", "SB", "SD"]
+PERFORMANCE_REPORT_TYPES = ["search_term_report", "targeting_report", "campaign_report"]
 
 
 def slugify(value: str) -> str:
@@ -28,6 +33,18 @@ def file_hash(path: Path) -> str:
     return h.hexdigest()[:12]
 
 
+def infer_ad_type(original_file: str = "", sheet_name: str = "", report_type: str = "") -> str:
+    text = f" {original_file} {sheet_name} {report_type} ".lower()
+    compact = text.replace("_", " ").replace("-", " ")
+    if "sponsored products" in compact or " sp " in compact or compact.strip().startswith("sp ") or "sp search" in compact:
+        return "SP"
+    if "sponsored brands" in compact or " sb " in compact or compact.strip().startswith("sb ") or "sb search" in compact or "multi ad group" in compact:
+        return "SB"
+    if "sponsored display" in compact or " sd " in compact or compact.strip().startswith("sd "):
+        return "SD"
+    return "Unknown"
+
+
 def _append_meta(record: dict) -> None:
     META_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(META_FILE, "a", encoding="utf-8") as f:
@@ -37,7 +54,7 @@ def _append_meta(record: dict) -> None:
 def load_meta() -> pd.DataFrame:
     if not META_FILE.exists():
         return pd.DataFrame()
-    rows: list[dict] = []
+    rows = []
     with open(META_FILE, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -46,12 +63,14 @@ def load_meta() -> pd.DataFrame:
             try:
                 rows.append(json.loads(line))
             except Exception:
-                continue
+                pass
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
     if "uploaded_at" in df.columns:
         df["uploaded_at"] = pd.to_datetime(df["uploaded_at"], errors="coerce")
+    if "ad_type" not in df.columns:
+        df["ad_type"] = df.apply(lambda r: infer_ad_type(r.get("original_file", ""), r.get("sheet_name", ""), r.get("report_type", "")), axis=1)
     return df
 
 
@@ -104,7 +123,11 @@ def save_uploaded_file(client_name: str, uploaded_file) -> list[dict]:
     outputs: list[dict] = []
     for sheet_name, df in _read_uploaded_file(raw_path):
         report_type = detect_report_type(original_name, sheet_name, df)
+        ad_type = infer_ad_type(original_name, sheet_name, report_type)
         std = standardize_performance_table(df)
+        std["ad_type"] = ad_type
+        std["source_report_type"] = report_type
+        std["source_sheet"] = sheet_name
         safe_sheet = slugify(sheet_name)
         processed_name = f"{ts}_{fhash}_{report_type}_{safe_sheet}.parquet"
         processed_path = processed_dir / processed_name
@@ -121,6 +144,7 @@ def save_uploaded_file(client_name: str, uploaded_file) -> list[dict]:
             "raw_path": str(raw_path),
             "sheet_name": sheet_name,
             "report_type": report_type,
+            "ad_type": ad_type,
             "processed_path": str(processed_path),
             "rows": int(len(std)),
             "columns": int(len(std.columns)),
@@ -136,8 +160,16 @@ def load_processed_report(record: dict | pd.Series) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
     if path.suffix == ".parquet":
-        return pd.read_parquet(path)
-    return pd.read_csv(path)
+        df = pd.read_parquet(path)
+    else:
+        df = pd.read_csv(path)
+    if "ad_type" not in df.columns:
+        df["ad_type"] = infer_ad_type(str(record.get("original_file", "")), str(record.get("sheet_name", "")), str(record.get("report_type", "")))
+    if "source_report_type" not in df.columns:
+        df["source_report_type"] = str(record.get("report_type", ""))
+    if "source_sheet" not in df.columns:
+        df["source_sheet"] = str(record.get("sheet_name", ""))
+    return df
 
 
 def list_reports(client_name: str | None = None, report_type: str | None = None) -> pd.DataFrame:
@@ -161,58 +193,91 @@ def latest_report(client_name: str, report_type: str) -> tuple[dict | None, pd.D
     return rec, load_processed_report(rec)
 
 
-def _latest_upload_group(reports: pd.DataFrame) -> pd.DataFrame:
-    """Return records from the latest original upload/hash when possible.
+def _latest_hash_for_performance(client_name: str) -> str | None:
+    reports = list_reports(client_name)
+    if reports.empty or "hash" not in reports.columns:
+        return None
+    perf = reports[reports["report_type"].isin(PERFORMANCE_REPORT_TYPES)]
+    if perf.empty:
+        return None
+    return str(perf.sort_values("uploaded_at", ascending=False).iloc[0]["hash"])
 
-    This lets the Client Dashboard combine SP + SB Search Term tabs from the same
-    Bulk Operations workbook instead of selecting only one sheet.
+
+def latest_performance_sections(client_name: str, mode: str = "search_term_first") -> dict[str, dict]:
+    """Return one combined performance dataframe per ad type.
+
+    This removes per-sheet report selection from the UI. For each ad type, the app
+    uses Search Term data when present, then falls back to Targeting, then Campaign.
+    That avoids double-counting metrics while still producing SP/SB/SD sections.
     """
+    reports = list_reports(client_name)
+    empty = {ad: {"df": pd.DataFrame(), "sources": [], "report_type": "none"} for ad in AD_TYPES}
     if reports.empty:
-        return reports
-    reports = reports.copy()
-    reports["uploaded_at"] = pd.to_datetime(reports["uploaded_at"], errors="coerce")
-    latest = reports.sort_values("uploaded_at", ascending=False).iloc[0]
-    if "hash" in reports.columns and pd.notna(latest.get("hash")):
-        same = reports[reports["hash"].astype(str) == str(latest["hash"])]
-        if not same.empty:
-            return same
-    # fallback: same original file from newest upload timestamp
-    same_file = reports[reports["original_file"].astype(str) == str(latest.get("original_file", ""))]
-    if not same_file.empty:
-        return same_file
-    return reports.head(1)
+        return empty
+
+    latest_hash = _latest_hash_for_performance(client_name)
+    if latest_hash:
+        batch = reports[reports["hash"].astype(str) == latest_hash].copy()
+    else:
+        batch = reports.copy()
+    batch = batch[batch["report_type"].isin(PERFORMANCE_REPORT_TYPES)].copy()
+    if batch.empty:
+        return empty
+    if "ad_type" not in batch.columns:
+        batch["ad_type"] = batch.apply(lambda r: infer_ad_type(r.get("original_file", ""), r.get("sheet_name", ""), r.get("report_type", "")), axis=1)
+
+    priority = ["search_term_report", "targeting_report", "campaign_report"]
+    out = {}
+    for ad_type in AD_TYPES:
+        ad_rows = batch[batch["ad_type"].astype(str).str.upper() == ad_type]
+        chosen_rt = None
+        chosen_rows = pd.DataFrame()
+        for rt in priority:
+            rt_rows = ad_rows[ad_rows["report_type"].astype(str) == rt]
+            if not rt_rows.empty:
+                chosen_rt = rt
+                chosen_rows = rt_rows.sort_values("uploaded_at", ascending=False)
+                break
+        frames = []
+        sources = []
+        if chosen_rt:
+            for _, rec in chosen_rows.iterrows():
+                d = load_processed_report(rec.to_dict())
+                if d.empty:
+                    continue
+                d = d.copy()
+                d["ad_type"] = ad_type
+                d["source_report_type"] = chosen_rt
+                d["source_sheet"] = rec.get("sheet_name", "")
+                frames.append(d)
+                sources.append({
+                    "ad_type": ad_type,
+                    "report_type": chosen_rt,
+                    "original_file": rec.get("original_file", ""),
+                    "sheet_name": rec.get("sheet_name", ""),
+                    "rows": int(len(d)),
+                    "spend": float(pd.to_numeric(d.get("spend", 0), errors="coerce").fillna(0).sum()) if "spend" in d.columns else 0.0,
+                    "ad_sales": float(pd.to_numeric(d.get("ad_sales", 0), errors="coerce").fillna(0).sum()) if "ad_sales" in d.columns else 0.0,
+                })
+        out[ad_type] = {
+            "df": pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(),
+            "sources": sources,
+            "report_type": chosen_rt or "none",
+        }
+    return out
+
+
+def combined_latest_performance(client_name: str) -> tuple[dict[str, dict], pd.DataFrame]:
+    sections = latest_performance_sections(client_name)
+    frames = [payload["df"] for payload in sections.values() if not payload["df"].empty]
+    combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    return sections, combined
 
 
 def get_latest_performance_source(client_name: str) -> tuple[str, dict | None, pd.DataFrame]:
-    """Return the latest combined performance data for dashboards.
-
-    Priority: combine all latest Search Term Report tabs, then targeting tabs,
-    then campaign tabs. This fixes understated spend/ad sales when one Bulk Ops
-    workbook contains multiple Search Term Report sheets.
-    """
-    priority = ["search_term_report", "targeting_report", "campaign_report", "bulk_operations_template"]
-    for rt in priority:
-        reports = list_reports(client_name, rt)
-        if reports.empty:
-            continue
-        group = _latest_upload_group(reports)
-        frames = []
-        records = []
-        for _, row in group.iterrows():
-            df = load_processed_report(row)
-            if df.empty:
-                continue
-            has_perf = ("spend" in df.columns and pd.to_numeric(df["spend"], errors="coerce").fillna(0).sum() > 0) or ("ad_sales" in df.columns and pd.to_numeric(df["ad_sales"], errors="coerce").fillna(0).sum() > 0)
-            if has_perf:
-                tmp = df.copy()
-                tmp["_source_sheet"] = row.get("sheet_name", "")
-                tmp["_source_file"] = row.get("original_file", "")
-                frames.append(tmp)
-                records.append(row.to_dict())
-        if frames:
-            combined = pd.concat(frames, ignore_index=True, sort=False)
-            first = records[0] if records else group.iloc[0].to_dict()
-            first["combined_sheets"] = ", ".join([str(r.get("sheet_name", "")) for r in records])
-            first["combined_records"] = len(records)
-            return rt, first, combined
-    return "none", None, pd.DataFrame()
+    sections, combined = combined_latest_performance(client_name)
+    sources = []
+    for ad_type, payload in sections.items():
+        sources.extend(payload.get("sources", []))
+    rec = {"original_file": "combined latest performance", "sheet_name": "SP/SB/SD combined", "sources": sources} if sources else None
+    return "combined_by_ad_type", rec, combined
