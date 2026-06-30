@@ -1,182 +1,218 @@
+from __future__ import annotations
 from pathlib import Path
 from datetime import datetime
-import warnings
+import hashlib
+import json
 import pandas as pd
-from .config import UPLOADS_DIR, PROCESSED_DIR, ensure_directories
 
-REPORT_TYPES = [
-    "Business Report",
-    "Bulk Operations",
-    "Search Term Report",
-    "Targeting Report",
-    "Campaign Report",
-    "Placement Report",
-    "Inventory Report",
-    "Profit Matrix",
-    "Listing Copy",
-]
+from modules.config import UPLOADS_DIR, PROCESSED_DIR, get_client_config
+from modules.report_mapper import detect_report_type, standardize_performance_table
+
+DATA_LOADER_VERSION = "2026-06-30-absolute-imports-combined-perf-v2"
+
+META_FILE = PROCESSED_DIR / "processed_reports.jsonl"
 
 
-def safe_name(value: str) -> str:
-    return "".join(char if char.isalnum() or char in ["-", "_"] else "_" for char in value.strip())
+def slugify(value: str) -> str:
+    out = "".join(ch if ch.isalnum() else "_" for ch in str(value).strip().lower())
+    while "__" in out:
+        out = out.replace("__", "_")
+    return out.strip("_") or "unknown"
 
 
-def save_uploaded_file(client_name: str, report_type: str, uploaded_file) -> Path:
-    ensure_directories()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    client_dir = UPLOADS_DIR / safe_name(client_name) / timestamp
-    client_dir.mkdir(parents=True, exist_ok=True)
-    file_name = f"{safe_name(report_type)}__{uploaded_file.name}"
-    output_path = client_dir / file_name
-    output_path.write_bytes(uploaded_file.getbuffer())
-    return output_path
+def file_hash(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()[:12]
 
 
-def _cell_has_value(value) -> bool:
-    return value is not None and str(value).strip() != ""
+def _append_meta(record: dict) -> None:
+    META_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(META_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, default=str) + "\n")
 
 
-def _make_unique_columns(raw_columns: list) -> list[str]:
-    columns = []
-    seen = {}
-    for idx, col in enumerate(raw_columns):
-        name = str(col).strip() if _cell_has_value(col) else f"Unnamed_{idx + 1}"
-        if name in seen:
-            seen[name] += 1
-            name = f"{name}_{seen[name]}"
-        else:
-            seen[name] = 0
-        columns.append(name)
-    return columns
-
-
-def _rows_to_dataframe(rows: list[tuple]) -> pd.DataFrame:
+def load_meta() -> pd.DataFrame:
+    if not META_FILE.exists():
+        return pd.DataFrame()
+    rows: list[dict] = []
+    with open(META_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
     if not rows:
         return pd.DataFrame()
-
-    # Amazon bulk exports sometimes have workbook dimensions incorrectly set to A1.
-    # We read rows manually and find the first row that looks like a real header.
-    header_idx = 0
-    for i, row in enumerate(rows[:25]):
-        non_empty = sum(_cell_has_value(v) for v in row)
-        if non_empty >= 2:
-            header_idx = i
-            break
-
-    header = list(rows[header_idx])
-    data_rows = list(rows[header_idx + 1 :])
-    max_cols = max([len(header)] + [len(r) for r in data_rows]) if data_rows else len(header)
-    header = header + [None] * (max_cols - len(header))
-    columns = _make_unique_columns(header)
-
-    normalized_rows = []
-    for row in data_rows:
-        padded = list(row) + [None] * (max_cols - len(row))
-        normalized_rows.append(padded[:max_cols])
-
-    df = pd.DataFrame(normalized_rows, columns=columns)
-    df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
+    df = pd.DataFrame(rows)
+    if "uploaded_at" in df.columns:
+        df["uploaded_at"] = pd.to_datetime(df["uploaded_at"], errors="coerce")
     return df
 
 
-def read_xlsx_sheets(path: Path) -> dict[str, pd.DataFrame]:
-    """Read every useful sheet from an Excel workbook.
-
-    This intentionally uses openpyxl's reset_dimensions() path because Amazon bulk
-    operation downloads often declare the worksheet dimension as A1 even when the
-    sheet contains thousands of rows. pandas/openpyxl can otherwise return only one
-    blank-looking column, which causes spend/ad sales to show as zero.
-    """
-    import openpyxl
-
-    sheets: dict[str, pd.DataFrame] = {}
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-
-    for ws in wb.worksheets:
-        try:
-            ws.reset_dimensions()
-        except Exception:
-            pass
-
-        rows = []
-        for row in ws.iter_rows(values_only=True):
-            if any(_cell_has_value(v) for v in row):
-                rows.append(row)
-        df = _rows_to_dataframe(rows)
-        if not df.empty and len(df.columns) > 1:
-            sheets[ws.title] = df
+def _read_excel_sheets(path: Path) -> list[tuple[str, pd.DataFrame]]:
+    sheets: list[tuple[str, pd.DataFrame]] = []
     try:
-        wb.close()
+        xls = pd.ExcelFile(path, engine="openpyxl")
+        for sheet_name in xls.sheet_names:
+            try:
+                df = pd.read_excel(path, sheet_name=sheet_name, engine="openpyxl")
+                if df is not None and not df.empty:
+                    df = df.dropna(how="all")
+                    if not df.empty:
+                        sheets.append((sheet_name, df))
+            except Exception:
+                continue
     except Exception:
         pass
     return sheets
 
 
-def _concat_with_source(sheets: dict[str, pd.DataFrame], names: list[str]) -> pd.DataFrame:
-    frames = []
-    for name in names:
-        df = sheets[name].copy()
-        df["Source Sheet"] = name
-        frames.append(df)
-    return pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
-
-
-def _has_columns(df: pd.DataFrame, required: list[str]) -> bool:
-    cols = " | ".join(str(c).strip().lower() for c in df.columns)
-    return all(req.lower() in cols for req in required)
-
-
-def read_table(path: Path) -> pd.DataFrame:
+def _read_uploaded_file(path: Path) -> list[tuple[str, pd.DataFrame]]:
     suffix = path.suffix.lower()
     if suffix in [".xlsx", ".xlsm", ".xls"]:
-        sheets = read_xlsx_sheets(path)
-        if not sheets:
-            return pd.read_excel(path)
-
-        # For Amazon bulk workbooks, the search term tabs are the safest source
-        # for account-level ad spend/ad sales because campaign tabs can duplicate
-        # performance across campaign, ad group, keyword, and ad rows.
-        search_term_names = [name for name in sheets if "search term" in name.lower()]
-        if search_term_names:
-            return _concat_with_source(sheets, search_term_names)
-
-        # Otherwise prefer the largest sheet that actually has performance columns.
-        perf_names = [
-            name for name, df in sheets.items()
-            if _has_columns(df, ["Spend", "Sales"]) or _has_columns(df, ["Cost", "Sales"])
-        ]
-        if perf_names:
-            return _concat_with_source(sheets, perf_names)
-
-        # Fallback to the largest useful sheet.
-        best_name = max(sheets, key=lambda n: len(sheets[n]) * max(1, len(sheets[n].columns)))
-        return sheets[best_name]
-
+        return _read_excel_sheets(path)
     if suffix == ".csv":
-        return pd.read_csv(path)
-    if suffix in [".txt", ".tsv"]:
+        return [("csv", pd.read_csv(path))]
+    if suffix == ".txt":
         try:
-            return pd.read_csv(path, sep="\t")
+            return [("txt", pd.read_csv(path, sep="\t"))]
         except Exception:
-            return pd.read_csv(path)
-    raise ValueError(f"Unsupported file type: {suffix}")
+            return [("txt", pd.read_csv(path))]
+    return []
 
 
-def list_uploaded_files(client_name: str | None = None) -> pd.DataFrame:
-    ensure_directories()
-    root = UPLOADS_DIR if not client_name else UPLOADS_DIR / safe_name(client_name)
-    rows = []
-    if not root.exists():
-        return pd.DataFrame(columns=["client", "timestamp", "file", "path"])
-    for file_path in root.rglob("*"):
-        if file_path.is_file():
-            parts = file_path.relative_to(UPLOADS_DIR).parts
-            rows.append({
-                "client": parts[0] if len(parts) > 0 else "",
-                "timestamp": parts[1] if len(parts) > 1 else "",
-                "file": file_path.name,
-                "path": str(file_path),
-            })
-    return pd.DataFrame(rows).sort_values(["client", "timestamp", "file"], ascending=[True, False, True]) if rows else pd.DataFrame(columns=["client", "timestamp", "file", "path"])
+def save_uploaded_file(client_name: str, uploaded_file) -> list[dict]:
+    client_slug = slugify(client_name)
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    upload_dir = UPLOADS_DIR / client_slug / ts
+    processed_dir = PROCESSED_DIR / client_slug
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    processed_dir.mkdir(parents=True, exist_ok=True)
+
+    original_name = uploaded_file.name
+    raw_path = upload_dir / original_name
+    with open(raw_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+
+    fhash = file_hash(raw_path)
+    outputs: list[dict] = []
+    for sheet_name, df in _read_uploaded_file(raw_path):
+        report_type = detect_report_type(original_name, sheet_name, df)
+        std = standardize_performance_table(df)
+        safe_sheet = slugify(sheet_name)
+        processed_name = f"{ts}_{fhash}_{report_type}_{safe_sheet}.parquet"
+        processed_path = processed_dir / processed_name
+        try:
+            std.to_parquet(processed_path, index=False)
+        except Exception:
+            processed_path = processed_path.with_suffix(".csv")
+            std.to_csv(processed_path, index=False)
+        record = {
+            "client_name": client_name,
+            "client_slug": client_slug,
+            "uploaded_at": datetime.utcnow().isoformat(),
+            "original_file": original_name,
+            "raw_path": str(raw_path),
+            "sheet_name": sheet_name,
+            "report_type": report_type,
+            "processed_path": str(processed_path),
+            "rows": int(len(std)),
+            "columns": int(len(std.columns)),
+            "hash": fhash,
+        }
+        _append_meta(record)
+        outputs.append(record)
+    return outputs
+
+
+def load_processed_report(record: dict | pd.Series) -> pd.DataFrame:
+    path = Path(record["processed_path"])
+    if not path.exists():
+        return pd.DataFrame()
+    if path.suffix == ".parquet":
+        return pd.read_parquet(path)
+    return pd.read_csv(path)
+
+
+def list_reports(client_name: str | None = None, report_type: str | None = None) -> pd.DataFrame:
+    df = load_meta()
+    if df.empty:
+        return df
+    if client_name:
+        df = df[df["client_name"].astype(str) == str(client_name)]
+    if report_type:
+        df = df[df["report_type"].astype(str) == str(report_type)]
+    if not df.empty and "uploaded_at" in df.columns:
+        df = df.sort_values("uploaded_at", ascending=False)
+    return df.reset_index(drop=True)
+
+
+def latest_report(client_name: str, report_type: str) -> tuple[dict | None, pd.DataFrame]:
+    reports = list_reports(client_name, report_type)
+    if reports.empty:
+        return None, pd.DataFrame()
+    rec = reports.iloc[0].to_dict()
+    return rec, load_processed_report(rec)
+
+
+def _latest_upload_group(reports: pd.DataFrame) -> pd.DataFrame:
+    """Return records from the latest original upload/hash when possible.
+
+    This lets the Client Dashboard combine SP + SB Search Term tabs from the same
+    Bulk Operations workbook instead of selecting only one sheet.
+    """
+    if reports.empty:
+        return reports
+    reports = reports.copy()
+    reports["uploaded_at"] = pd.to_datetime(reports["uploaded_at"], errors="coerce")
+    latest = reports.sort_values("uploaded_at", ascending=False).iloc[0]
+    if "hash" in reports.columns and pd.notna(latest.get("hash")):
+        same = reports[reports["hash"].astype(str) == str(latest["hash"])]
+        if not same.empty:
+            return same
+    # fallback: same original file from newest upload timestamp
+    same_file = reports[reports["original_file"].astype(str) == str(latest.get("original_file", ""))]
+    if not same_file.empty:
+        return same_file
+    return reports.head(1)
+
+
+def get_latest_performance_source(client_name: str) -> tuple[str, dict | None, pd.DataFrame]:
+    """Return the latest combined performance data for dashboards.
+
+    Priority: combine all latest Search Term Report tabs, then targeting tabs,
+    then campaign tabs. This fixes understated spend/ad sales when one Bulk Ops
+    workbook contains multiple Search Term Report sheets.
+    """
+    priority = ["search_term_report", "targeting_report", "campaign_report", "bulk_operations_template"]
+    for rt in priority:
+        reports = list_reports(client_name, rt)
+        if reports.empty:
+            continue
+        group = _latest_upload_group(reports)
+        frames = []
+        records = []
+        for _, row in group.iterrows():
+            df = load_processed_report(row)
+            if df.empty:
+                continue
+            has_perf = ("spend" in df.columns and pd.to_numeric(df["spend"], errors="coerce").fillna(0).sum() > 0) or ("ad_sales" in df.columns and pd.to_numeric(df["ad_sales"], errors="coerce").fillna(0).sum() > 0)
+            if has_perf:
+                tmp = df.copy()
+                tmp["_source_sheet"] = row.get("sheet_name", "")
+                tmp["_source_file"] = row.get("original_file", "")
+                frames.append(tmp)
+                records.append(row.to_dict())
+        if frames:
+            combined = pd.concat(frames, ignore_index=True, sort=False)
+            first = records[0] if records else group.iloc[0].to_dict()
+            first["combined_sheets"] = ", ".join([str(r.get("sheet_name", "")) for r in records])
+            first["combined_records"] = len(records)
+            return rt, first, combined
+    return "none", None, pd.DataFrame()
