@@ -4,7 +4,7 @@ import re
 from typing import Any
 import pandas as pd
 
-RULES_ENGINE_VERSION = "2026-06-30-adtype-sections-v5"
+RULES_ENGINE_VERSION = "2026-06-30-bulk-ai-export-v5"
 PRIORITY_ORDER = {"High": 0, "Medium": 1, "Low": 2}
 
 GENERIC_FORBIDDEN_PARTS = {"energy", "drink", "drinks", "water", "sparkling", "caffeine", "natural", "organic", "the", "and"}
@@ -56,6 +56,22 @@ def _best_target_text(row: pd.Series) -> str:
             if val and val.lower() not in {"nan", "none", "0"}:
                 return val.lower()
     return ""
+
+
+def _raw_export_fields(row: pd.Series) -> dict:
+    fields = {}
+    wanted = [
+        "raw__product", "raw__entity", "raw__operation", "raw__campaign_id", "raw__ad_group_id",
+        "raw__keyword_id", "raw__product_targeting_id", "raw__campaign_name", "raw__ad_group_name",
+        "raw__state", "raw__keyword_text", "raw__match_type", "raw__bid", "raw__budget",
+        "raw__daily_budget", "raw__placement_type", "raw__placement", "raw__placement_percent",
+        "raw__placement_percentage", "raw__portfolio_id", "raw__product_targeting_expression",
+        "raw__resolved_product_targeting_expression", "raw__customer_search_term", "raw__search_term"
+    ]
+    for col in wanted:
+        if col in row.index:
+            fields[col] = _safe_text(row.get(col))
+    return fields
 
 def _campaign(row: pd.Series) -> str:
     return _safe_text(row.get("campaign", ""))
@@ -166,7 +182,7 @@ def generate_actions(performance_df: pd.DataFrame, client_config: dict | None = 
         target = _best_target_text(row)
         campaign = _campaign(row)
         ad_group = _ad_group(row)
-        base = {"ad_type": _safe_text(row.get("ad_type", "Unknown")) or "Unknown", "campaign": campaign, "ad_group": ad_group, "target": target, "spend": round(spend,2), "ad_sales": round(ad_sales,2), "clicks": int(clicks), "orders": int(orders), "current_bid": current_bid}
+        base = {"ad_type": _safe_text(row.get("ad_type", "Unknown")) or "Unknown", "campaign": campaign, "ad_group": ad_group, "target": target, "spend": round(spend,2), "ad_sales": round(ad_sales,2), "clicks": int(clicks), "orders": int(orders), "current_bid": current_bid, **_raw_export_fields(row)}
 
         if spend >= min_spend and clicks >= min_clicks and orders == 0:
             key = ("waste_no_orders", campaign, ad_group, target)
