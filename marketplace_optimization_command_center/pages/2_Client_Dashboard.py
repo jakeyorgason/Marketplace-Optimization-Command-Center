@@ -34,6 +34,29 @@ actions = generate_actions(df, cfg)
 score, status, flags = health_score(metrics, cfg, action_count=int((actions["priority"] == "High").sum()) if not actions.empty and "priority" in actions else 0)
 
 st.subheader(f"Status: {status}")
+source_label = rec.get("sheet_name", "") if rec else ""
+source_file = rec.get("original_file", "") if rec else ""
+st.caption(f"Performance source: {source_type} — {source_file} — {source_label} — {len(df):,} combined rows")
+with st.expander("Dashboard metric debug"):
+    st.write("Data loader source is combined across all matching sheets from the latest upload batch.")
+    st.write({
+        "source_type": source_type,
+        "source_file": source_file,
+        "source_sheet": source_label,
+        "combined_rows": int(len(df)),
+        "spend_sum": float(metrics.get("spend", 0)),
+        "ad_sales_sum": float(metrics.get("ad_sales", 0)),
+        "business_report_total_sales": float(total_sales),
+    })
+    if "source_sheet" in df.columns:
+        sheet_summary = df.groupby("source_sheet", dropna=False).agg(
+            rows=("source_sheet", "size"),
+            spend=("spend", "sum"),
+            ad_sales=("ad_sales", "sum"),
+            clicks=("clicks", "sum"),
+            orders=("orders", "sum"),
+        ).reset_index().sort_values("spend", ascending=False)
+        st.dataframe(sheet_summary, use_container_width=True, hide_index=True)
 cols = st.columns(7)
 cols[0].metric("Health Score", f"{score}/100")
 cols[1].metric("Spend", f"${metrics['spend']:,.0f}")
