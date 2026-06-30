@@ -12,7 +12,7 @@ except Exception:  # local/package fallback
     from .config import UPLOADS_DIR, PROCESSED_DIR, get_client_config
     from .report_mapper import detect_report_type, standardize_performance_table
 
-DATA_LOADER_VERSION = "2026-06-30-adtype-loader-v2"
+DATA_LOADER_VERSION = "2026-06-30-adtype-raw-preserve-v3"
 META_FILE = PROCESSED_DIR / "processed_reports.jsonl"
 AD_TYPES = ["SP", "SB", "SD"]
 PERFORMANCE_REPORT_TYPES = ["search_term_report", "targeting_report", "campaign_report"]
@@ -125,6 +125,15 @@ def save_uploaded_file(client_name: str, uploaded_file) -> list[dict]:
         report_type = detect_report_type(original_name, sheet_name, df)
         ad_type = infer_ad_type(original_name, sheet_name, report_type)
         std = standardize_performance_table(df)
+        # Preserve original bulk/report columns so exports can match IDs and Amazon bulk fields.
+        raw = df.copy()
+        raw.columns = [str(c).strip().lower().replace("\n", " ").replace("  ", " ") for c in raw.columns]
+        raw = raw.reset_index(drop=True)
+        std = std.reset_index(drop=True)
+        for raw_col in raw.columns:
+            safe_raw_col = "raw__" + "".join(ch if ch.isalnum() else "_" for ch in raw_col).strip("_")
+            if safe_raw_col not in std.columns:
+                std[safe_raw_col] = raw[raw_col]
         std["ad_type"] = ad_type
         std["source_report_type"] = report_type
         std["source_sheet"] = sheet_name
