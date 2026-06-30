@@ -6,12 +6,13 @@ from typing import Any
 
 import pandas as pd
 
-AI_BULK_AUDIT_VERSION = "2026-06-30-secrets-all-actions-v2"
+AI_BULK_AUDIT_VERSION = "2026-06-30-brand-safety-optional-v3"
 
 
 ACTION_COLUMNS = [
     "ad_type", "priority", "category", "issue", "recommendation", "campaign", "ad_group",
-    "target", "spend", "ad_sales", "clicks", "orders", "current_bid", "suggested_bid",
+    "target", "affected_campaigns", "affected_ad_groups", "campaign_count", "ad_group_count",
+    "is_multi_campaign_brand_safety", "spend", "ad_sales", "clicks", "orders", "current_bid", "suggested_bid",
     "suggested_change_pct", "reason_code", "evidence", "match_type", "entity", "operation",
 ]
 
@@ -105,11 +106,12 @@ def deterministic_bulk_audit(
         scale = int((actions.get("category", pd.Series(dtype=str)).astype(str) == "Scale Opportunity").sum()) if "category" in actions.columns else 0
         brand = int((actions.get("category", pd.Series(dtype=str)).astype(str) == "Brand Safety").sum()) if "category" in actions.columns else 0
 
-        approve = ["high_click_no_order", "high_acos", "efficient_scale", "brand_safety_grouped"]
-        hold = ["low_cvr", "low_ctr", "diagnostic_only"]
+        # Brand Safety is review-only by default. The Bulk Upload Builder can opt it into upload after human review.
+        approve = ["high_click_no_order", "high_acos", "efficient_scale"]
+        hold = ["low_cvr", "low_ctr", "diagnostic_only", "brand_safety_grouped"]
 
-        if not forbidden and "brand_safety_grouped" in approve:
-            approve.remove("brand_safety_grouped")
+        if not forbidden and "brand_safety_grouped" in hold:
+            hold.remove("brand_safety_grouped")
         if mode in ["profit", "profitability", "conservative"]:
             approve = [code for code in approve if code in ["high_click_no_order", "high_acos", "brand_safety_grouped"]]
         elif mode in ["aggressive", "scale", "growth"]:
@@ -174,6 +176,8 @@ def _build_payload(
             "Hold diagnostic actions that should be reviewed but not uploaded directly.",
             "Be more aggressive only when the client's growth mode and TACOS room support it.",
             "Protect against branded leakage when forbidden terms appear in shopper search terms or targets.",
+            "Treat Brand Safety actions as review-only by default. Do not include brand_safety_grouped in approve_reason_codes unless there is clear evidence it belongs in non-brand campaigns and is safe to upload.",
+            "If campaign names appear branded, warn the user rather than recommending automatic negatives for those campaigns.",
         ],
     }
     return payload, warnings
@@ -246,6 +250,7 @@ def run_ai_bulk_audit(
                     "content": (
                         "You are a senior Amazon Ads strategist and bulk-operations QA reviewer. "
                         "You audit all provided actions, not only high-priority actions. "
+                        "Brand Safety actions are review-only by default; do not approve brand_safety_grouped unless clearly safe. "
                         "Return only valid JSON matching the schema."
                     ),
                 },
