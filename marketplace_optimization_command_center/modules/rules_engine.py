@@ -4,11 +4,77 @@ import re
 from typing import Any
 import pandas as pd
 
-RULES_ENGINE_VERSION = "2026-06-30-brand-campaign-level-v8"
+RULES_ENGINE_VERSION = "2026-07-02-bid-guardrails-v1"
 PRIORITY_ORDER = {"High": 0, "Medium": 1, "Low": 2}
 
 GENERIC_FORBIDDEN_PARTS = {"energy", "drink", "drinks", "water", "sparkling", "caffeine", "natural", "organic", "the", "and"}
 TARGET_FIELD_CANDIDATES = ["search_term", "target", "keyword", "keyword_text", "targeting", "product_targeting_expression", "resolved_expression", "asin"]
+
+DEFAULT_MAX_BID_BY_AD_TYPE = {"SP": 3.00, "SB": 4.00, "SD": 2.50}
+DEFAULT_MIN_BID = 0.05
+DEFAULT_MAX_INCREASE_PCT = 20.0
+DEFAULT_MIN_ORDERS_TO_SCALE = 3
+
+def _ad_type(row: pd.Series) -> str:
+    value = _safe_text(row.get("ad_type", "SP")).upper()
+    if value not in {"SP", "SB", "SD"}:
+        text = " ".join([_safe_text(row.get("raw__product", "")), _safe_text(row.get("product", "")), value]).lower()
+        if "sponsored brands" in text or "sb" == value.lower():
+            return "SB"
+        if "sponsored display" in text or "sd" == value.lower():
+            return "SD"
+        return "SP"
+    return value
+
+def _max_bid_for_row(row: pd.Series, settings: dict) -> float:
+    ad_type = _ad_type(row)
+    default_cap = DEFAULT_MAX_BID_BY_AD_TYPE.get(ad_type, 3.00)
+    return max(_safe_float(settings.get(f"max_bid_{ad_type.lower()}", default_cap), default_cap), DEFAULT_MIN_BID)
+
+def _min_bid(settings: dict) -> float:
+    return max(_safe_float(settings.get("min_bid", DEFAULT_MIN_BID), DEFAULT_MIN_BID), 0.01)
+
+def _guarded_bid(
+    current_bid: float,
+    desired_bid: float,
+    row: pd.Series,
+    settings: dict,
+    direction: str,
+) -> tuple[float, str]:
+    """Return a safe bid and a note explaining any cap/floor applied."""
+    current_bid = _safe_float(current_bid)
+    desired_bid = _safe_float(desired_bid)
+    cap = _max_bid_for_row(row, settings)
+    floor = _min_bid(settings)
+    max_increase_pct = max(_safe_float(settings.get("max_increase_pct", DEFAULT_MAX_INCREASE_PCT), DEFAULT_MAX_INCREASE_PCT), 0.0)
+    notes = []
+    safe = desired_bid
+
+    if direction == "increase" and current_bid > 0:
+        run_cap = current_bid * (1 + max_increase_pct / 100)
+        if safe > run_cap:
+            safe = run_cap
+            notes.append(f"increase capped at {max_increase_pct:.0f}% per run")
+
+    if safe > cap:
+        safe = cap
+        notes.append(f"absolute { _ad_type(row) } bid cap ${cap:.2f}")
+
+    if 0 < safe < floor:
+        safe = floor
+        notes.append(f"minimum bid floor ${floor:.2f}")
+
+    safe = _round_bid(safe)
+    if current_bid > 0 and direction == "increase" and safe <= current_bid:
+        notes.append("no increase exported because current bid is already at/above guardrail cap")
+    return safe, "; ".join(notes)
+
+def _suggested_change_pct(current_bid: float, suggested_bid: float) -> float:
+    current_bid = _safe_float(current_bid)
+    suggested_bid = _safe_float(suggested_bid)
+    if current_bid <= 0 or suggested_bid <= 0:
+        return 0.0
+    return round(((suggested_bid / current_bid) - 1) * 100, 1)
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -112,6 +178,7 @@ def generate_actions(performance_df: pd.DataFrame, client_config: dict | None = 
 
     min_spend = _safe_float(settings.get("min_spend", 20), 20)
     min_clicks = int(_safe_float(settings.get("min_clicks", 10), 10))
+    min_orders_to_scale = int(_safe_float(settings.get("min_orders_to_scale", DEFAULT_MIN_ORDERS_TO_SCALE), DEFAULT_MIN_ORDERS_TO_SCALE))
     actions: list[dict] = []
 
     # Brand Safety grouped by ad type + campaign + ad group + shopper/target text.
@@ -213,33 +280,43 @@ def generate_actions(performance_df: pd.DataFrame, client_config: dict | None = 
         target = _best_target_text(row)
         campaign = _campaign(row)
         ad_group = _ad_group(row)
-        base = {"ad_type": _safe_text(row.get("ad_type", "Unknown")) or "Unknown", "campaign": campaign, "ad_group": ad_group, "target": target, "spend": round(spend,2), "ad_sales": round(ad_sales,2), "clicks": int(clicks), "orders": int(orders), "current_bid": current_bid, **_raw_export_fields(row)}
+        row_ad_type = _ad_type(row)
+        max_bid_cap = _max_bid_for_row(row, settings)
+        base = {"ad_type": row_ad_type, "campaign": campaign, "ad_group": ad_group, "target": target, "spend": round(spend,2), "ad_sales": round(ad_sales,2), "clicks": int(clicks), "orders": int(orders), "current_bid": current_bid, "max_bid_cap": max_bid_cap, **_raw_export_fields(row)}
 
         if spend >= min_spend and clicks >= min_clicks and orders == 0:
             key = ("waste_no_orders", campaign, ad_group, target)
             if key not in seen_keys:
                 seen_keys.add(key)
-                suggested = _round_bid(current_bid * 0.65) if current_bid else 0
-                actions.append({**base, "priority": "High", "category": "Waste Cut", "area": "Ads", "issue": "High clicks/spend with no orders", "recommendation": "Reduce bid and review as negative exact candidate if query intent is poor.", "suggested_bid": suggested, "suggested_change_pct": -35 if current_bid else 0, "estimated_monthly_impact": _estimate_impact(spend, ad_sales, "Waste Cut"), "confidence": "High", "reason_code": "high_click_no_order", "evidence": f"{int(clicks)} clicks, ${spend:,.2f} spend, 0 orders"})
+                suggested, guard_note = _guarded_bid(current_bid, current_bid * 0.65 if current_bid else 0, row, settings, "decrease")
+                evidence = f"{int(clicks)} clicks, ${spend:,.2f} spend, 0 orders" + (f" | Guardrail: {guard_note}" if guard_note else "")
+                actions.append({**base, "priority": "High", "category": "Waste Cut", "area": "Ads", "issue": "High clicks/spend with no orders", "recommendation": "Reduce bid and review as negative exact candidate if query intent is poor.", "suggested_bid": suggested, "suggested_change_pct": _suggested_change_pct(current_bid, suggested), "estimated_monthly_impact": _estimate_impact(spend, ad_sales, "Waste Cut"), "confidence": "High", "reason_code": "high_click_no_order", "guardrail_note": guard_note, "evidence": evidence})
         elif ad_sales > 0 and target_acos and acos > target_acos * 1.35 and spend >= min_spend:
             key = ("high_acos", campaign, ad_group, target)
             if key not in seen_keys:
                 seen_keys.add(key)
                 pct = -20 if growth_mode in ["aggressive", "scale"] else -30
-                suggested = _round_bid(current_bid * (1 + pct/100)) if current_bid else 0
-                actions.append({**base, "priority": "High" if acos > target_acos * 1.75 else "Medium", "category": "Waste Cut", "area": "Ads", "issue": "ACOS materially above target", "recommendation": f"Reduce bid by {abs(pct)}% and review query relevance.", "suggested_bid": suggested, "suggested_change_pct": pct, "estimated_monthly_impact": _estimate_impact(spend, ad_sales, "Waste Cut"), "confidence": "Medium", "reason_code": "high_acos", "evidence": f"ACOS {acos:.1%} vs target {target_acos:.1%}"})
-        elif ad_sales >= max(50, min_spend * 2) and target_acos and acos < target_acos * 0.65 and orders >= 2:
+                suggested, guard_note = _guarded_bid(current_bid, current_bid * (1 + pct/100) if current_bid else 0, row, settings, "decrease")
+                evidence = f"ACOS {acos:.1%} vs target {target_acos:.1%}" + (f" | Guardrail: {guard_note}" if guard_note else "")
+                actions.append({**base, "priority": "High" if acos > target_acos * 1.75 else "Medium", "category": "Waste Cut", "area": "Ads", "issue": "ACOS materially above target", "recommendation": f"Reduce bid by {abs(pct)}% and review query relevance.", "suggested_bid": suggested, "suggested_change_pct": _suggested_change_pct(current_bid, suggested), "estimated_monthly_impact": _estimate_impact(spend, ad_sales, "Waste Cut"), "confidence": "Medium", "reason_code": "high_acos", "guardrail_note": guard_note, "evidence": evidence})
+        elif ad_sales >= max(50, min_spend * 2) and target_acos and acos < target_acos * 0.65 and orders >= min_orders_to_scale:
             key = ("scale", campaign, ad_group, target)
             if key not in seen_keys:
                 seen_keys.add(key)
                 pct = 20 if growth_mode in ["aggressive", "scale"] else 12
-                suggested = _round_bid(current_bid * (1 + pct/100)) if current_bid else 0
-                actions.append({**base, "priority": "High" if ad_sales >= 250 else "Medium", "category": "Scale Opportunity", "area": "Ads", "issue": "Efficient target with room to scale", "recommendation": f"Increase bid by {pct}% if budget and TACOS allow.", "suggested_bid": suggested, "suggested_change_pct": pct, "estimated_monthly_impact": _estimate_impact(spend, ad_sales, "Scale Opportunity"), "confidence": "Medium", "reason_code": "efficient_scale", "evidence": f"ACOS {acos:.1%} vs target {target_acos:.1%}; {int(orders)} orders"})
+                desired = current_bid * (1 + pct/100) if current_bid else 0
+                suggested, guard_note = _guarded_bid(current_bid, desired, row, settings, "increase")
+                if current_bid > 0 and suggested > current_bid:
+                    evidence = f"ACOS {acos:.1%} vs target {target_acos:.1%}; {int(orders)} orders" + (f" | Guardrail: {guard_note}" if guard_note else "")
+                    actions.append({**base, "priority": "High" if ad_sales >= 250 else "Medium", "category": "Scale Opportunity", "area": "Ads", "issue": "Efficient target with room to scale", "recommendation": f"Increase bid cautiously if budget and TACOS allow. Guardrails cap increases at ${max_bid_cap:.2f} for {row_ad_type}.", "suggested_bid": suggested, "suggested_change_pct": _suggested_change_pct(current_bid, suggested), "estimated_monthly_impact": _estimate_impact(spend, ad_sales, "Scale Opportunity"), "confidence": "Medium", "reason_code": "efficient_scale", "guardrail_note": guard_note, "evidence": evidence})
+                else:
+                    evidence = f"ACOS {acos:.1%} vs target {target_acos:.1%}; {int(orders)} orders | Guardrail: current bid ${current_bid:.2f} is already at/above {row_ad_type} cap ${max_bid_cap:.2f}"
+                    actions.append({**base, "priority": "Medium", "category": "Watchlist", "area": "Ads", "issue": "Efficient target but bid is already high", "recommendation": "Do not increase bid. Consider budget, placement, campaign structure, or listing work instead.", "suggested_bid": 0.0, "suggested_change_pct": 0.0, "estimated_monthly_impact": _estimate_impact(spend, ad_sales, "Scale Opportunity"), "confidence": "High", "reason_code": "scale_guardrail_blocked", "guardrail_note": guard_note or "increase blocked by bid cap", "evidence": evidence})
         elif clicks >= 40 and cvr < 0.04 and spend >= min_spend:
             key = ("low_cvr", campaign, ad_group, target)
             if key not in seen_keys:
                 seen_keys.add(key)
-                actions.append({**base, "priority": "Medium", "category": "Listing / CVR", "area": "Listing", "issue": "Traffic is not converting well", "recommendation": "Audit price, reviews, hero image, bullets, offer, and query-to-listing fit.", "suggested_bid": current_bid, "suggested_change_pct": 0, "estimated_monthly_impact": _estimate_impact(spend, ad_sales, "Listing / CVR"), "confidence": "Medium", "reason_code": "low_cvr", "evidence": f"{int(clicks)} clicks, CVR {cvr:.1%}"})
+                actions.append({**base, "priority": "Medium", "category": "Listing / CVR", "area": "Listing", "issue": "Traffic is not converting well", "recommendation": "Audit price, reviews, hero image, bullets, offer, and query-to-listing fit.", "suggested_bid": 0.0, "suggested_change_pct": 0, "estimated_monthly_impact": _estimate_impact(spend, ad_sales, "Listing / CVR"), "confidence": "Medium", "reason_code": "low_cvr", "evidence": f"{int(clicks)} clicks, CVR {cvr:.1%}"})
 
     out = pd.DataFrame(actions)
     if out.empty:
