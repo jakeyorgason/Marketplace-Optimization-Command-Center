@@ -46,6 +46,18 @@ with st.expander("Client rules used for this build", expanded=False):
 with st.expander("Recommendation settings", expanded=False):
     min_spend = st.number_input("Minimum spend for waste rules", value=20.0, step=5.0)
     min_clicks = st.number_input("Minimum clicks for click-based rules", value=10, step=1)
+    min_orders_to_scale = st.number_input("Minimum orders before scaling a target", value=3, step=1, help="Prevents bid increases from tiny sample sizes.")
+    st.markdown("**Bid guardrails**")
+    g1, g2, g3, g4 = st.columns(4)
+    with g1:
+        max_bid_sp = st.number_input("Max SP bid", value=3.00, step=0.25, format="%.2f")
+    with g2:
+        max_bid_sb = st.number_input("Max SB bid", value=4.00, step=0.25, format="%.2f")
+    with g3:
+        max_bid_sd = st.number_input("Max SD bid", value=2.50, step=0.25, format="%.2f")
+    with g4:
+        max_increase_pct = st.number_input("Max bid increase per run", value=20.0, step=5.0, format="%.1f")
+    min_bid = st.number_input("Minimum bid floor", value=0.05, step=0.05, format="%.2f")
     show_all = st.checkbox("Show medium/low priority actions too", value=False)
     include_brand_safety_upload = st.checkbox(
         "Allow Brand Safety negatives in upload exports",
@@ -58,7 +70,17 @@ with st.expander("Recommendation settings", expanded=False):
         help="Checks campaign/ad group/affected campaign names for the client's forbidden terms before allowing Brand Safety rows into upload exports."
     )
     st.caption("AI audit uses OPENAI_API_KEY, OPENAI_MODEL, and OPENAI_REASONING_EFFORT from Streamlit secrets.")
-settings = {"min_spend": min_spend, "min_clicks": min_clicks}
+settings = {
+    "min_spend": min_spend,
+    "min_clicks": min_clicks,
+    "min_orders_to_scale": min_orders_to_scale,
+    "max_bid_sp": max_bid_sp,
+    "max_bid_sb": max_bid_sb,
+    "max_bid_sd": max_bid_sd,
+    "max_increase_pct": max_increase_pct,
+    "min_bid": min_bid,
+}
+st.caption(f"Bid guardrails active: SP <= ${max_bid_sp:.2f}, SB <= ${max_bid_sb:.2f}, SD <= ${max_bid_sd:.2f}; max increase {max_increase_pct:.0f}% per run.")
 
 
 def _forbidden_tokens(raw: str) -> list[str]:
@@ -90,7 +112,7 @@ def _prepare_export_selection(df: pd.DataFrame, include_brand: bool, exclude_bra
     if "reason_code" not in out.columns:
         out["include_in_bulk_upload"] = True
         return out
-    brand_mask = out["reason_code"].astype(str).eq("brand_safety_grouped")
+    brand_mask = out["reason_code"].astype(str).str.startswith("brand_safety")
     out["include_in_bulk_upload"] = True
     if brand_mask.any():
         out.loc[brand_mask, "include_in_bulk_upload"] = bool(include_brand)
@@ -144,7 +166,7 @@ approved_by_ai = apply_audit_decisions(actions_by_ad_type, audit, high_priority_
 brand_review_count = 0
 for _df in actions_by_ad_type.values():
     if _df is not None and not _df.empty and "reason_code" in _df.columns:
-        brand_review_count += int(_df["reason_code"].astype(str).eq("brand_safety_grouped").sum())
+        brand_review_count += int(_df["reason_code"].astype(str).str.startswith("brand_safety").sum())
 if brand_review_count:
     if include_brand_safety_upload:
         st.warning(f"Brand Safety upload is ON. {brand_review_count:,} Brand Safety review rows can be included only if approved and upload-safe.")
@@ -166,7 +188,7 @@ for ad_type in ["SP", "SB", "SD"]:
     display = suggested.copy()
     # Always surface Brand Safety rows for visibility/review, even when AI keeps them out of the default export plan.
     if "reason_code" in generated.columns:
-        brand_rows = generated[generated["reason_code"].astype(str).eq("brand_safety_grouped")].copy()
+        brand_rows = generated[generated["reason_code"].astype(str).str.startswith("brand_safety")].copy()
         if not brand_rows.empty:
             display = pd.concat([display, brand_rows], ignore_index=True).drop_duplicates()
     if show_all:
@@ -177,7 +199,7 @@ for ad_type in ["SP", "SB", "SD"]:
         final_selected[ad_type] = pd.DataFrame()
         continue
 
-    upload_preview = build_bulk_rows(display, ad_type)
+    upload_preview = build_bulk_rows(display, ad_type, client_name=client)
     with st.expander(f"{ad_type} Actions ({len(display):,} shown, {len(upload_preview):,} upload rows)", expanded=(ad_type == "SP")):
         section_summary = audit.get("sections", {}).get(ad_type, {}).get("summary", "")
         if section_summary:
@@ -186,13 +208,13 @@ for ad_type in ["SP", "SB", "SD"]:
             "priority", "category", "campaign", "ad_group", "target",
             "issue", "recommendation",
             "affected_campaigns", "affected_ad_groups", "campaign_count", "ad_group_count",
-            "spend", "ad_sales", "clicks", "orders", "current_bid", "suggested_bid", "reason_code", "evidence"
+            "spend", "ad_sales", "clicks", "orders", "current_bid", "suggested_bid", "max_bid_cap", "guardrail_note", "reason_code", "evidence"
         ] if c in display.columns]
         table = display.copy().reset_index(drop=True)
         table["_row_id"] = table.index
         editor_df = table[["_row_id"] + cols].copy()
         if "reason_code" in editor_df.columns:
-            approve_default = ~editor_df["reason_code"].astype(str).eq("brand_safety_grouped")
+            approve_default = ~editor_df["reason_code"].astype(str).str.startswith("brand_safety")
             if include_brand_safety_upload:
                 approve_default = pd.Series([True] * len(editor_df), index=editor_df.index)
         else:
@@ -218,14 +240,14 @@ for ad_type in ["SP", "SB", "SD"]:
         )
 
         with st.expander(f"{ad_type} upload preview", expanded=False):
-            preview = build_bulk_rows(final_selected[ad_type], ad_type)
+            preview = build_bulk_rows(final_selected[ad_type], ad_type, client_name=client)
             st.dataframe(preview, use_container_width=True)
             brand_selected = 0
             brand_uploadable = 0
             if not final_selected[ad_type].empty and "reason_code" in final_selected[ad_type].columns:
-                brand_selected = int(final_selected[ad_type]["reason_code"].astype(str).eq("brand_safety_grouped").sum())
+                brand_selected = int(final_selected[ad_type]["reason_code"].astype(str).str.startswith("brand_safety").sum())
                 if "include_in_bulk_upload" in final_selected[ad_type].columns:
-                    brand_uploadable = int((final_selected[ad_type]["reason_code"].astype(str).eq("brand_safety_grouped") & final_selected[ad_type]["include_in_bulk_upload"].astype(bool)).sum())
+                    brand_uploadable = int((final_selected[ad_type]["reason_code"].astype(str).str.startswith("brand_safety") & final_selected[ad_type]["include_in_bulk_upload"].astype(bool)).sum())
             if brand_selected:
                 st.caption(f"Brand Safety selected for review: {brand_selected:,}. Brand Safety eligible for upload after safeguards: {brand_uploadable:,}.")
 
@@ -235,7 +257,7 @@ created_paths = []
 
 for idx, ad_type in enumerate(["SP", "SB", "SD"]):
     selected = final_selected.get(ad_type, pd.DataFrame())
-    upload_rows = build_bulk_rows(selected, ad_type)
+    upload_rows = build_bulk_rows(selected, ad_type, client_name=client)
     with export_cols[idx]:
         st.metric(f"{ad_type} upload rows", len(upload_rows))
         if st.button(f"Build {ad_type} upload", disabled=upload_rows.empty, key=f"build_{ad_type}"):
