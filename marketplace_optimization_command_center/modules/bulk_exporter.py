@@ -18,7 +18,7 @@ except Exception:  # pragma: no cover
     from .config import EXPORTS_DIR, APP_DIR
     from .data_loader import slugify, list_reports, load_processed_report
 
-BULK_EXPORTER_VERSION = "2026-06-30-valid-id-resolver-v6"
+BULK_EXPORTER_VERSION = "2026-07-02-bid-guardrails-dedupe-v1"
 
 TEMPLATE_PATH = APP_DIR / "templates" / "PxP_SP_Bulk_Upload_Jun25_2026_FIXED_v2.xlsx"
 DEFAULT_COLUMNS = [
@@ -28,6 +28,27 @@ DEFAULT_COLUMNS = [
 ]
 PRODUCT_BY_AD_TYPE = {"SP": "Sponsored Products", "SB": "Sponsored Brands", "SD": "Sponsored Display"}
 BRAND_REASON_PREFIX = "brand_safety"
+
+EXPORT_DEFAULT_MAX_BID_BY_AD_TYPE = {"SP": 3.00, "SB": 4.00, "SD": 2.50}
+
+def _round_to_nickel(value: float) -> float:
+    value = _safe_float(value, 0.0)
+    if value <= 0:
+        return 0.0
+    return round(round(value / 0.05) * 0.05, 2)
+
+def _export_bid_cap(row: pd.Series, ad_type: str) -> float:
+    cap = _safe_float(row.get("max_bid_cap"), 0.0)
+    if cap <= 0:
+        cap = EXPORT_DEFAULT_MAX_BID_BY_AD_TYPE.get(str(ad_type).upper(), 3.00)
+    return max(cap, 0.05)
+
+def _guard_export_bid(row: pd.Series, ad_type: str) -> float:
+    suggested = _safe_float(row.get("suggested_bid"), 0.0)
+    if suggested <= 0:
+        return 0.0
+    cap = _export_bid_cap(row, ad_type)
+    return _round_to_nickel(min(suggested, cap))
 
 
 def _out_dir(client_name: str) -> Path:
@@ -255,7 +276,7 @@ def _fill_product_targeting_id(data: dict, row: pd.Series, lookup: dict) -> None
 
 def _bid_update_row(row: pd.Series, ad_type: str, lookup: dict | None = None) -> dict:
     lookup = lookup or {"campaign_adgroup": {}, "keyword": {}, "product_target": {}}
-    suggested_bid = _safe_float(row.get("suggested_bid"), 0)
+    suggested_bid = _guard_export_bid(row, ad_type)
     is_pt = _is_product_target(row)
     entity = "Product Targeting" if is_pt else "Keyword"
     keyword_text = "" if is_pt else (_raw(row, "keyword text") or _safe_text(row.get("keyword_text")) or _safe_text(row.get("target")))
@@ -276,7 +297,7 @@ def _bid_update_row(row: pd.Series, ad_type: str, lookup: dict | None = None) ->
         "State": _raw(row, "state") or _safe_text(row.get("state")) or "enabled",
         "Keyword Text": keyword_text,
         "Match Type": "" if is_pt else (_raw(row, "match type") or _safe_text(row.get("match_type")) or "exact"),
-        "Bid": round(suggested_bid, 2) if suggested_bid > 0 else "",
+        "Bid": suggested_bid if suggested_bid > 0 else "",
         "Budget": "",
         "Daily Budget": "",
         "Placement Type": "",
@@ -386,6 +407,71 @@ def _is_valid_upload_row(row: dict) -> tuple[bool, str]:
     return True, ""
 
 
+
+def _numeric_or_zero(value) -> float:
+    return _safe_float(value, 0.0)
+
+
+def _choose_safest_update(group: pd.DataFrame) -> pd.Series:
+    """For duplicate update IDs, keep one row. Lower bid is safer than exporting duplicates."""
+    if group.empty:
+        return pd.Series(dtype=object)
+    g = group.copy()
+    g["_bid_num"] = g["Bid"].apply(_numeric_or_zero) if "Bid" in g.columns else 0.0
+    if (g["_bid_num"] > 0).any():
+        return g.sort_values(["_bid_num"], ascending=True).iloc[0].drop(labels=["_bid_num"], errors="ignore")
+    return g.iloc[0].drop(labels=["_bid_num"], errors="ignore")
+
+
+def _dedupe_upload_rows(out: pd.DataFrame) -> pd.DataFrame:
+    """Remove duplicate Amazon update/create keys before upload.
+
+    Amazon rejects duplicate Keyword ID / Product Targeting ID updates in the same file.
+    This keeps one upload row per unique object and chooses the safer/lower bid when
+    duplicate update rows conflict.
+    """
+    if out is None or out.empty:
+        return out
+    df = out.copy().reset_index(drop=True)
+    df["_original_order"] = range(len(df))
+    keep_parts = []
+
+    entity = df.get("Entity", pd.Series([""] * len(df))).astype(str).str.lower()
+    op = df.get("Operation", pd.Series([""] * len(df))).astype(str).str.lower()
+
+    kw_mask = op.eq("update") & entity.eq("keyword")
+    pt_mask = op.eq("update") & entity.eq("product targeting")
+    neg_kw_mask = op.eq("create") & entity.eq("negative keyword")
+    neg_pt_mask = op.eq("create") & entity.eq("negative product targeting")
+    camp_mask = op.eq("update") & entity.eq("campaign")
+    handled = kw_mask | pt_mask | neg_kw_mask | neg_pt_mask | camp_mask
+
+    if kw_mask.any():
+        keys = ["Campaign ID", "Ad Group ID", "Keyword ID"]
+        keep_parts.append(df.loc[kw_mask].groupby(keys, dropna=False, as_index=False, group_keys=False).apply(_choose_safest_update))
+    if pt_mask.any():
+        keys = ["Campaign ID", "Ad Group ID", "Product Targeting ID"]
+        keep_parts.append(df.loc[pt_mask].groupby(keys, dropna=False, as_index=False, group_keys=False).apply(_choose_safest_update))
+    if neg_kw_mask.any():
+        keys = ["Campaign ID", "Ad Group ID", "Keyword Text", "Match Type"]
+        keep_parts.append(df.loc[neg_kw_mask].drop_duplicates(subset=keys, keep="first"))
+    if neg_pt_mask.any():
+        keys = ["Campaign ID", "Ad Group ID", "Product Targeting Expression"]
+        keep_parts.append(df.loc[neg_pt_mask].drop_duplicates(subset=keys, keep="first"))
+    if camp_mask.any():
+        # For duplicate campaign budget updates, use the lower daily budget as the safer value.
+        g = df.loc[camp_mask].copy()
+        g["_budget_num"] = g["Daily Budget"].apply(_numeric_or_zero) if "Daily Budget" in g.columns else 0.0
+        keep_parts.append(g.sort_values(["Campaign ID", "_budget_num"]).drop_duplicates(subset=["Campaign ID"], keep="first").drop(columns=["_budget_num"], errors="ignore"))
+    if (~handled).any():
+        keep_parts.append(df.loc[~handled])
+
+    if not keep_parts:
+        return df.drop(columns=["_original_order"], errors="ignore")
+    deduped = pd.concat(keep_parts, ignore_index=True)
+    deduped = deduped.sort_values("_original_order").drop(columns=["_original_order"], errors="ignore")
+    return deduped.reset_index(drop=True)
+
 def build_bulk_rows(actions: pd.DataFrame, ad_type: str, client_name: str | None = None, include_invalid: bool = False) -> pd.DataFrame:
     headers = _template_headers()
     rows: list[dict] = []
@@ -421,6 +507,7 @@ def build_bulk_rows(actions: pd.DataFrame, ad_type: str, client_name: str | None
         out = pd.DataFrame(columns=headers)
     else:
         out = out.drop_duplicates()
+        out = _dedupe_upload_rows(out)
         for h in headers:
             if h not in out.columns:
                 out[h] = ""
